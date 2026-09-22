@@ -2,28 +2,29 @@
 -export([main/1]).
 
 %% =====================================================================
-%% Punto de entrada. Por ahora solo lee la imagen de entrada y arma la
-%% lista de tuplas {R,G,B}; todavia no usa pa_matriz/regiones/bordes
-%% (eso se conecta cuando esté listo el resto del pipeline: division en
-%% regiones, procesos y comunicación con Scheme).
+%% Punto de entrada. Uso: image_processor Entrada Salida N
+%% Lee el PPM, arma la matriz, la divide en N regiones con halo, las
+%% procesa en paralelo (por ahora con el placeholder de trabajador/4,
+%% ver TODO ahi) y escribe la imagen reconstruida.
 %% =====================================================================
-main([Nombre]) ->
-    io:format("Argumentos recibidos ~p~n", [Nombre]),
-    {ok, Contenido} = file:read_file(Nombre), %lee el arcihvo
+main([Entrada, Salida, NStr]) ->
+    N = list_to_integer(NStr),
+    {ok, Contenido} = file:read_file(Entrada), %lee el arcihvo
     Texto = binary_to_list(Contenido), %Pasa los bits a una lista
     Tokens = string:tokens(Texto, " \n\r\t"), % lo transforma todo en un strnig para manejarlo mejor
-    %io:format("~p~n", [Tokens]),
-    ["P3", Ancho, Alto, Max | Pixeles] = Tokens, %Los primeros numeros de un ppm son sobre sus caracteristicas, eso es lo que sacamos aca.
-    Lista_linda = lists:map(fun(X) -> list_to_integer(X) end, Pixeles), %devolvemos todo a int, es necesario pasarlo a string? hasata ahora lo pienso
+    ["P3", AnchoStr, AltoStr, MaxStr | PixelesStr] = Tokens, %Los primeros numeros de un ppm son sobre sus caracteristicas, eso es lo que sacamos aca.
+    Ancho = list_to_integer(AnchoStr),
+    Alto = list_to_integer(AltoStr),
+    Max = list_to_integer(MaxStr),
+    Lista_linda = lists:map(fun(X) -> list_to_integer(X) end, PixelesStr), %devolvemos todo a int, es necesario pasarlo a string? hasata ahora lo pienso
     Lista_lista = agrupar(Lista_linda), %se llama lista_lista porque es una lista que ya esta lista para usarse jajaja yo si soy gracioso.
-    %io:format("Ancho: ~p~n", [Ancho]),
-    %io:format("Alto: ~p~n", [Alto]),
-    %io:format("Max: ~p~n", [Max]),
-    %io:format("Pixeles: ~p~n", [Lista_lista]),
-    %conectamos con scheme
-    %% TODO: esto todavia no manda nada real a Scheme (protocolo sin definir).
-    Resultado = os:cmd("racket prueba.rkt"),
-    io:format("Scheme respondio ~s~n", [Resultado]).
+
+    Matriz = pa_matriz(Lista_lista, Ancho),
+    Radio = 1, % radio del kernel 3x3 obligatorio
+    Regiones = dividir(Matriz, Radio, Alto, N),
+    Resultados = procesar_paralelo(Regiones, Radio),
+    MatrizFinal = reconstruir(Resultados),
+    escribir_ppm(Salida, Ancho, Alto, Max, MatrizFinal).
 
 %% ---------------------------------------------------------------------
 %% agrupar/1: convierte la lista plana de enteros [R,G,B,R,G,B,...]
@@ -107,14 +108,56 @@ dividir(Matriz, Radio, Alto, N) ->
 
 %% ---------------------------------------------------------------------
 %% trabajador/4: codigo que corre DENTRO de cada proceso hijo (Paso 3).
-%% Por ahora, como Scheme todavia no esta conectado, en vez de difuminar
-%% de verdad solo recorta el halo (placeholder identidad) -- sirve para
-%% probar division/reconstruccion antes de meter Scheme.
-%% TODO: reemplazar el recorte por la llamada real a Scheme, mandandole
-%% Submatriz + kernel y recibiendo la region ya filtrada.
-%% Le manda al padre {resultado, Ini, FilasRecortadas} para que el
-%% padre sepa a que region corresponde esta respuesta.
+%% Por ahora, mientras armamos el protocolo con Scheme, solo recorta el
+%% halo (placeholder identidad) -- sirve para probar division/
+%% reconstruccion. TODO: reemplazar por la llamada real a Scheme.
 %% ---------------------------------------------------------------------
 trabajador(Padre, Ini, Radio, Submatriz) ->
     FilasRecortadas = lists:sublist(Submatriz, Radio + 1, length(Submatriz) - 2 * Radio),
     Padre ! {resultado, Ini, FilasRecortadas}.
+
+%% ---------------------------------------------------------------------
+%% procesar_paralelo/2: crea un proceso (spawn) por cada region de
+%% ListaDeRegiones (la salida de dividir/4) y espera todos los
+%% resultados. Como corren en paralelo, pueden terminar en cualquier
+%% orden -- por eso cada uno vuelve etiquetado con su Ini.
+%% procesar_paralelo([[Ini,Submatriz],...], Radio) -> [{Ini,Filas}, ...]
+%% ---------------------------------------------------------------------
+procesar_paralelo(ListaDeRegiones, Radio) ->
+    Padre = self(),
+    lists:foreach(
+        fun([Ini, Submatriz]) ->
+            spawn(fun() -> trabajador(Padre, Ini, Radio, Submatriz) end)
+        end,
+        ListaDeRegiones
+    ),
+    recolectar(length(ListaDeRegiones)).
+
+%% recolectar/1: junta Cantidad mensajes {resultado, Ini, Filas} de la
+%% casilla de correo, sin importar el orden en que lleguen.
+%% TODO: cuando trabajador/4 hable con Scheme de verdad, va a poder
+%% avisar tambien un {error, Ini, Motivo} -- hay que manejarlo aca para
+%% no dejar pasar una region fallida en silencio.
+recolectar(0) -> [];
+recolectar(Cantidad) ->
+    receive
+        {resultado, Ini, Filas} ->
+            [{Ini, Filas} | recolectar(Cantidad - 1)]
+    end.
+
+%% ---------------------------------------------------------------------
+%% reconstruir/1: ordena los resultados por Ini (deshace el desorden
+%% de la concurrencia) y concatena todas las filas en una sola matriz.
+%% ---------------------------------------------------------------------
+reconstruir(Resultados) ->
+    Ordenados = lists:keysort(1, Resultados),
+    lists:append([Filas || {_Ini, Filas} <- Ordenados]).
+
+%% ---------------------------------------------------------------------
+%% escribir_ppm/5: escribe la matriz final como un archivo PPM P3.
+%% ---------------------------------------------------------------------
+escribir_ppm(Salida, Ancho, Alto, Max, Matriz) ->
+    Cabecera = io_lib:format("P3~n~p ~p~n~p~n", [Ancho, Alto, Max]),
+    Pixeles = lists:append(Matriz),
+    Cuerpo = [io_lib:format("~p ~p ~p~n", [R, G, B]) || {R, G, B} <- Pixeles],
+    ok = file:write_file(Salida, [Cabecera, Cuerpo]).
