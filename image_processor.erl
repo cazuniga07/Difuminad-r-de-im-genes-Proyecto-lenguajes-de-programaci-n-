@@ -26,7 +26,7 @@ main([Entrada, Salida, NStr, Filtro]) ->
     ArchivoKernel = "kernel.txt",
     escribir_kernel(ArchivoKernel, Kernel), % se escribe una sola vez, es igual para todas las regiones
     Matriz = pa_matriz(Lista_lista, Ancho),
-    Radio = 1, % radio del kernel 3x3 obligatorio
+    Radio = 10, % radio del kernel 3x3 obligatorio
     Regiones = dividir(Matriz, Radio, Alto, N),
     Resultados = procesar_paralelo(Regiones, Radio, ArchivoKernel, Ancho, Filtro),
     MatrizFinal = reconstruir(Resultados),
@@ -128,10 +128,13 @@ dividir(Matriz, Radio, Alto, N) ->
 %% =======================================================================
 
 %% ---------------------------------------------------------------------
-%% kernel_gaussiano/0: kernel 3x3 obligatorio, sin normalizar (Scheme
-%% divide entre la suma de los pesos, 16 en este caso).
+%% kernel_gaussiano/1: kernel (2*Radio+1)x(2*Radio+1), aproximacion
+%% binomial de la gaussiana, sin normalizar. La suma de los pesos es
+%% 2^(4*Radio): 16 con Radio=1, 2^40 con Radio=10.
 %% ---------------------------------------------------------------------
-kernel_gaussiano() -> [[1, 2, 1], [2, 4, 2], [1, 2, 1]].
+kernel_gaussiano(Radio) ->
+    Fila = fila_pascal(2 * Radio),
+    producto_exterior(Fila, Fila).
 
 %% ---------------------------------------------------------------------
 %% fila_a_texto/1: [{R,G,B}, ...] -> iolist "R G B R G B ...\n"
@@ -284,3 +287,31 @@ escribir_ppm(Salida, Ancho, Alto, Max, Matriz) ->
     Pixeles = lists:append(Matriz),
     Cuerpo = [io_lib:format("~p ~p ~p~n", [R, G, B]) || {R, G, B} <- Pixeles],
     ok = file:write_file(Salida, [Cabecera, Cuerpo]).
+
+
+
+%% ---------------------------------------------------------------------
+%% fila_pascal/1: fila N del triangulo de Pascal [C(N,0), ..., C(N,N)].
+%% Cada coeficiente se saca del anterior: C(N,K+1) = C(N,K)*(N-K)/(K+1)
+%% ---------------------------------------------------------------------
+fila_pascal(N) -> fila_pascal(N, 0, 1).
+
+fila_pascal(N, K, _Actual) when K > N -> [];
+fila_pascal(N, K, Actual) ->
+    Siguiente = Actual * (N - K) div (K + 1),
+    [Actual | fila_pascal(N, K + 1, Siguiente)].
+
+%% ---------------------------------------------------------------------
+%% escalar_fila/2: multiplica cada elemento de Fila por Escalar.
+%% ---------------------------------------------------------------------
+escalar_fila(_Escalar, []) -> [];
+escalar_fila(Escalar, [H | T]) -> [Escalar * H | escalar_fila(Escalar, T)].
+
+%% ---------------------------------------------------------------------
+%% producto_exterior/2: cada elemento de la primera lista genera una
+%% fila de la matriz (esa fila completa escalada por el elemento).
+%% ---------------------------------------------------------------------
+producto_exterior([], _Fila) -> [];
+producto_exterior([H | T], Fila) ->
+    [escalar_fila(H, Fila) | producto_exterior(T, Fila)].
+

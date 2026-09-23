@@ -1,0 +1,2 @@
+#!/bin/bash
+erl -noshell -run image_processor main "$@" -s init stop

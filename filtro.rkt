@@ -44,8 +44,7 @@
     (else(cons(proceso-fila matriz kernel k)(proceso(cdr matriz ) kernel k))))))
 
 
-(define leer-archivo
-  (lambda (nombre)
+(define leer-archivo (lambda (nombre)
     (call-with-input-file nombre
       (lambda (archivo)
         (port->lines archivo)))))
@@ -60,16 +59,14 @@
 
 
 
-(define entrada-region
-  (lambda(nombre)
+(define entrada-region (lambda(nombre)
     (cons
      (string->number (car (leer-archivo nombre)))
      (map (lambda(linea)
             (agrupar (tonumbers linea)))
           (cdr (leer-archivo nombre))))))
 
-(define entrada-kernel
-  (lambda(nombre)
+(define entrada-kernel (lambda(nombre)
     (map (lambda(linea)
            (tonumbers linea))
          (leer-archivo nombre))))

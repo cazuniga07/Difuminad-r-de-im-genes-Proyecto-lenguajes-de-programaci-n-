@@ -1,0 +1,122 @@
+================================================================
+MANUAL DE EJECUCION
+Proyecto: Procesamiento Paralelo de Imagenes con Scheme y Erlang
+================================================================
+
+REQUISITOS
+----------
+- Erlang/OTP instalado y accesible desde la linea de comandos
+  (se usan los comandos "erlc" y "erl").
+- Racket instalado y accesible desde la linea de comandos
+  (se usa el comando "racket").
+
+Verificar con:
+    erl -version
+    racket --version
+
+
+ARCHIVOS DEL PROYECTO
+----------------------
+- image_processor.erl   -> codigo fuente de Erlang (coordinador)
+- filtro.rkt            -> codigo fuente de Scheme (filtros)
+- image_processor       -> script ejecutable (interfaz solicitada)
+- *.ppm                 -> imagenes de prueba
+
+
+COMPILACION
+-----------
+Desde la carpeta raiz del proyecto (donde estan image_processor.erl
+y filtro.rkt), compilar el modulo de Erlang:
+
+    erlc image_processor.erl
+
+Esto genera image_processor.beam. El archivo filtro.rkt NO necesita
+compilacion previa, Racket lo interpreta directamente en cada
+ejecucion.
+
+Si el script "image_processor" no tiene permisos de ejecucion (por
+ejemplo, al descomprimir el zip), otorgarlos una sola vez con:
+
+    chmod +x image_processor
+
+
+EJECUCION
+---------
+Interfaz solicitada por el enunciado:
+
+    ./image_processor entrada.ppm salida.ppm 1
+    ./image_processor entrada.ppm salida.ppm 2
+    ./image_processor entrada.ppm salida.ppm 4
+    ./image_processor entrada.ppm salida.ppm 8
+
+El ultimo parametro numerico indica la cantidad de procesos Erlang a
+utilizar.
+
+Opcionalmente se puede indicar un CUARTO parametro para elegir el
+filtro a aplicar (si se omite, se usa "gaussian" por defecto):
+
+    ./image_processor entrada.ppm salida.ppm 4 gaussian
+    ./image_processor entrada.ppm salida.ppm 4 invertir
+
+Ejemplos concretos con las imagenes de prueba incluidas:
+
+    ./image_processor imagen_prueba.ppm salida.ppm 2
+    ./image_processor leon.ppm salida_leon.ppm 4
+    ./image_processor Walter.ppm salida_walter.ppm 8 invertir
+
+Forma alternativa de ejecutar, sin el script (equivalente):
+
+    erl -noshell -run image_processor main entrada.ppm salida.ppm 4 -s init stop
+
+
+QUE HACE EL PROGRAMA (RESUMEN)
+--------------------------------
+
+Lado Erlang (coordinador):
+  1. Lee el archivo PPM de entrada (encabezado y pixeles).
+  2. Organiza los pixeles en una matriz segun el ancho de la imagen.
+  3. Escribe una sola vez el archivo con el kernel gaussiano.
+  4. Divide la imagen en tantas regiones como procesos se pidieron
+     (o menos, si la imagen tiene menos filas que procesos pedidos),
+     agregando a cada region el "halo" necesario (filas de contexto
+     extra, tomadas de las regiones vecinas o repetidas si la region
+     esta en el borde de la imagen).
+  5. Crea un proceso de Erlang por cada region -- corren en paralelo,
+     de forma concurrente real (no una simple secuencia de llamadas).
+  6. Cada proceso escribe el archivo de su region, ejecuta una
+     instancia de Racket indicandole el filtro a aplicar, y espera su
+     codigo de salida (0 = exito, distinto de 0 = fallo).
+  7. Si una region falla, el programa lo informa y se detiene (no
+     genera una imagen incorrecta en silencio).
+  8. Una vez que todos los procesos respondieron, se ordenan sus
+     resultados segun la posicion original de cada region (pueden
+     llegar en cualquier orden por la concurrencia) y se reconstruye
+     la imagen completa.
+  9. Se escribe el archivo PPM de salida.
+
+Lado Scheme (una instancia independiente por region):
+  1. Lee el archivo de su region (radio del kernel + filas, incluido
+     el halo) y el archivo del kernel.
+  2. Segun el filtro indicado:
+     - "gaussian": separa los 3 canales de color, extiende cada fila
+       repitiendo su primer y ultimo pixel (para poder calcular
+       tambien los bordes izquierdo/derecho), desliza la ventana de
+       convolucion 3x3 sobre cada canal, y recombina los 3 canales
+       procesados.
+     - "invertir": descarta el halo recibido (no hace falta, esta
+       transformacion no usa pixeles vecinos) e invierte cada
+       componente de color (255 - valor) de los pixeles restantes.
+  3. Escribe el resultado en el archivo de salida indicado y termina
+     con codigo de salida 0 (exito) o distinto de 0 (error).
+
+
+SOLUCION DE PROBLEMAS
+-----------------------
+- "racket: command not found" -> Racket no esta instalado o no esta
+  en el PATH del sistema.
+- Error de archivo no encontrado al correr el script -> verificar que
+  se este ejecutando desde la carpeta del proyecto (image_processor.erl
+  y filtro.rkt deben estar en el directorio actual).
+- "ERROR: la region que empieza en la fila N fallo" -> una instancia
+  de Scheme termino con error; revisar que la imagen de entrada sea
+  un PPM P3 valido.
