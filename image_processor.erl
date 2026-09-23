@@ -161,3 +161,29 @@ escribir_ppm(Salida, Ancho, Alto, Max, Matriz) ->
     Pixeles = lists:append(Matriz),
     Cuerpo = [io_lib:format("~p ~p ~p~n", [R, G, B]) || {R, G, B} <- Pixeles],
     ok = file:write_file(Salida, [Cabecera, Cuerpo]).
+
+
+fila_a_texto(Fila) ->
+    Pixeles = [io_lib:format("~p ~p ~p ", [R, G, B]) || {R, G, B} <- Fila],
+    [Pixeles, "\n"].
+
+
+
+escribir_entrada_region(Archivo, Radio, Submatriz) ->
+    Radio2 = io_lib:format("~p~n", [Radio]),
+    Cuerpo = [fila_a_texto(X) || X <- Submatriz], 
+    ok = file:write_file(Archivo, [Radio2, Cuerpo]).
+
+
+
+fila_a_texto_gauss(Fila) ->
+    RGB = [io_lib:format("~p ", [A]) || A <- Fila],
+    [RGB, "\n"].
+
+
+kernel_gaussiano() -> [[1, 2, 1], [2, 4, 2], [1, 2, 1]].
+
+
+escribir_kernel(Archivo, Kernel) ->
+    Cuerpo = [fila_a_texto_gauss(X) || X <- Kernel], 
+    ok = file:write_file(Archivo, Cuerpo).
