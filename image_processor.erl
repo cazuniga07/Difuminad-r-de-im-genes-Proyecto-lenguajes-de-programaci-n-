@@ -19,10 +19,13 @@ main([Entrada, Salida, NStr]) ->
     Lista_linda = lists:map(fun(X) -> list_to_integer(X) end, PixelesStr), %devolvemos todo a int, es necesario pasarlo a string? hasata ahora lo pienso
     Lista_lista = agrupar(Lista_linda), %se llama lista_lista porque es una lista que ya esta lista para usarse jajaja yo si soy gracioso.
 
+    Kernel = kernel_gaussiano(),
+    ArchivoKernel = "kernel.txt",
+    escribir_kernel(ArchivoKernel, Kernel), % se escribe una sola vez, es igual para todas las regiones
     Matriz = pa_matriz(Lista_lista, Ancho),
     Radio = 1, % radio del kernel 3x3 obligatorio
     Regiones = dividir(Matriz, Radio, Alto, N),
-    Resultados = procesar_paralelo(Regiones, Radio),
+    Resultados = procesar_paralelo(Regiones, Radio, ArchivoKernel),
     MatrizFinal = reconstruir(Resultados),
     escribir_ppm(Salida, Ancho, Alto, Max, MatrizFinal).
 
@@ -107,42 +110,47 @@ dividir(Matriz, Radio, Alto, N) ->
     [[Ini, submatriz(Matriz, Radio, Alto, [Ini, Fin])] || [Ini, Fin] <- Regiones].
 
 %% ---------------------------------------------------------------------
-%% trabajador/4: codigo que corre DENTRO de cada proceso hijo (Paso 3).
-%% Por ahora, mientras armamos el protocolo con Scheme, solo recorta el
-%% halo (placeholder identidad) -- sirve para probar division/
-%% reconstruccion. TODO: reemplazar por la llamada real a Scheme.
+%% trabajador/5: codigo que corre DENTRO de cada proceso hijo (Paso 3).
+%% Le pide a llamar_scheme/4 que procese la region de verdad, y le
+%% manda el resultado (o el error) al padre, etiquetado con Ini.
 %% ---------------------------------------------------------------------
-trabajador(Padre, Ini, Radio, Submatriz) ->
-    FilasRecortadas = lists:sublist(Submatriz, Radio + 1, length(Submatriz) - 2 * Radio),
-    Padre ! {resultado, Ini, FilasRecortadas}.
+trabajador(Padre, Ini, Radio, Submatriz, ArchivoKernel) ->
+    case llamar_scheme(Ini, Radio, Submatriz, ArchivoKernel) of
+        {ok, Filas} -> Padre ! {resultado, Ini, Filas};
+        {error, Motivo} -> Padre ! {error, Ini, Motivo}
+    end.
 
 %% ---------------------------------------------------------------------
-%% procesar_paralelo/2: crea un proceso (spawn) por cada region de
+%% procesar_paralelo/3: crea un proceso (spawn) por cada region de
 %% ListaDeRegiones (la salida de dividir/4) y espera todos los
 %% resultados. Como corren en paralelo, pueden terminar en cualquier
 %% orden -- por eso cada uno vuelve etiquetado con su Ini.
-%% procesar_paralelo([[Ini,Submatriz],...], Radio) -> [{Ini,Filas}, ...]
+%% procesar_paralelo([[Ini,Submatriz],...], Radio, ArchivoKernel) ->
+%%   [{Ini,Filas}, ...]
 %% ---------------------------------------------------------------------
-procesar_paralelo(ListaDeRegiones, Radio) ->
+procesar_paralelo(ListaDeRegiones, Radio, ArchivoKernel) ->
     Padre = self(),
     lists:foreach(
         fun([Ini, Submatriz]) ->
-            spawn(fun() -> trabajador(Padre, Ini, Radio, Submatriz) end)
+            spawn(fun() -> trabajador(Padre, Ini, Radio, Submatriz, ArchivoKernel) end)
         end,
         ListaDeRegiones
     ),
     recolectar(length(ListaDeRegiones)).
 
 %% recolectar/1: junta Cantidad mensajes {resultado, Ini, Filas} de la
-%% casilla de correo, sin importar el orden en que lleguen.
-%% TODO: cuando trabajador/4 hable con Scheme de verdad, va a poder
-%% avisar tambien un {error, Ini, Motivo} -- hay que manejarlo aca para
-%% no dejar pasar una region fallida en silencio.
+%% casilla de correo, sin importar el orden en que lleguen. Si algun
+%% proceso avisa {error, Ini, Motivo}, se corta ahi mismo -- no se deja
+%% pasar en silencio una region fallida (requisito de tolerancia a
+%% fallos).
 recolectar(0) -> [];
 recolectar(Cantidad) ->
     receive
         {resultado, Ini, Filas} ->
-            [{Ini, Filas} | recolectar(Cantidad - 1)]
+            [{Ini, Filas} | recolectar(Cantidad - 1)];
+        {error, Ini, Motivo} ->
+            io:format("ERROR: la region que empieza en la fila ~p fallo: ~p~n", [Ini, Motivo]),
+            erlang:error({region_fallida, Ini, Motivo})
     end.
 
 %% ---------------------------------------------------------------------
@@ -163,27 +171,100 @@ escribir_ppm(Salida, Ancho, Alto, Max, Matriz) ->
     ok = file:write_file(Salida, [Cabecera, Cuerpo]).
 
 
+%% =======================================================================
+%% Protocolo de comunicacion con Scheme (archivos de texto, uno por
+%% region, mas uno para el kernel -- compartido por todas las regiones).
+%% Cada archivo se lee completo hasta EOF, sin declarar cuantas filas
+%% tiene, porque cada bloque de datos vive en su propio archivo.
+%% =======================================================================
+
+%% ---------------------------------------------------------------------
+%% fila_a_texto/1: [{R,G,B}, ...] -> iolist "R G B R G B ...\n"
+%% (una fila de PIXELES, para el archivo de region)
+%% ---------------------------------------------------------------------
 fila_a_texto(Fila) ->
     Pixeles = [io_lib:format("~p ~p ~p ", [R, G, B]) || {R, G, B} <- Fila],
     [Pixeles, "\n"].
 
-
-
+%% ---------------------------------------------------------------------
+%% escribir_entrada_region/3: escribe el archivo que le toca leer a
+%% Scheme para UNA region: primera linea el Radio, despues cada fila
+%% de la Submatriz (que ya incluye el halo de arriba/abajo).
+%% ---------------------------------------------------------------------
 escribir_entrada_region(Archivo, Radio, Submatriz) ->
     Radio2 = io_lib:format("~p~n", [Radio]),
-    Cuerpo = [fila_a_texto(X) || X <- Submatriz], 
+    Cuerpo = [fila_a_texto(X) || X <- Submatriz],
     ok = file:write_file(Archivo, [Radio2, Cuerpo]).
 
-
-
+%% ---------------------------------------------------------------------
+%% fila_a_texto_gauss/1: [N, ...] -> iolist "N N N ...\n"
+%% (una fila de NUMEROS sueltos, para el archivo del kernel -- funciona
+%% para cualquier tamano de fila, no solo 3, por si el kernel cambia)
+%% ---------------------------------------------------------------------
 fila_a_texto_gauss(Fila) ->
     RGB = [io_lib:format("~p ", [A]) || A <- Fila],
     [RGB, "\n"].
 
-
+%% ---------------------------------------------------------------------
+%% kernel_gaussiano/0: kernel 3x3 obligatorio, sin normalizar (Scheme
+%% divide entre la suma de los pesos, 16 en este caso).
+%% ---------------------------------------------------------------------
 kernel_gaussiano() -> [[1, 2, 1], [2, 4, 2], [1, 2, 1]].
 
-
+%% ---------------------------------------------------------------------
+%% escribir_kernel/2: escribe el archivo del kernel -- generica, le
+%% sirve a cualquier kernel que se le pase (no solo al gaussiano de
+%% kernel_gaussiano/0), por si en la defensa piden cambiar el tamano.
+%% ---------------------------------------------------------------------
 escribir_kernel(Archivo, Kernel) ->
-    Cuerpo = [fila_a_texto_gauss(X) || X <- Kernel], 
+    Cuerpo = [fila_a_texto_gauss(X) || X <- Kernel],
     ok = file:write_file(Archivo, Cuerpo).
+
+%% ---------------------------------------------------------------------
+%% linea_a_fila/1: texto de UNA linea del archivo de salida de Scheme
+%% ("R G B R G B ...") -> fila de tuplas {R,G,B}.
+%% ---------------------------------------------------------------------
+linea_a_fila(Linea) ->
+    Numeros = [list_to_integer(X) || X <- string:tokens(Linea, " ")],
+    agrupar(Numeros).
+
+%% ---------------------------------------------------------------------
+%% leer_salida_scheme/1: lee el archivo que escribio Scheme (una fila
+%% procesada por linea, sin halo, hasta EOF) y lo convierte de vuelta
+%% en una matriz (lista de filas de tuplas {R,G,B}).
+%% ---------------------------------------------------------------------
+leer_salida_scheme(Archivo) ->
+    {ok, Contenido} = file:read_file(Archivo),
+    Texto = binary_to_list(Contenido),
+    Lineas = string:tokens(Texto, "\n"),
+    [linea_a_fila(L) || L <- Lineas].
+
+
+%% ---------------------------------------------------------------------
+%% llamar_scheme/4: ejecuta una instancia de Racket para procesar UNA
+%% region. Escribe su archivo de entrada (region+radio), corre el
+%% script con open_port (para leer su codigo de salida real), y si
+%% salio bien lee el archivo de resultado. Nunca deja pasar un fallo
+%% en silencio: devuelve {ok, Filas} o {error, Motivo}.
+%% ---------------------------------------------------------------------
+llamar_scheme(Ini, Radio, Submatriz, ArchivoKernel) ->
+    ArchivoRegion = "region_" ++ integer_to_list(Ini) ++ ".txt",
+    ArchivoSalida = "salida_" ++ integer_to_list(Ini) ++ ".txt",
+    escribir_entrada_region(ArchivoRegion, Radio, Submatriz),
+
+    Comando = "racket filtro.rkt " ++ ArchivoRegion ++ " " ++ ArchivoKernel ++ " " ++ ArchivoSalida,
+    Puerto = open_port({spawn, Comando}, [exit_status]),
+    Codigo = receive
+        {Puerto, {exit_status, C}} -> C
+    end,
+
+    file:delete(ArchivoRegion),
+
+    case Codigo of
+        0 ->
+            Filas = leer_salida_scheme(ArchivoSalida),
+            file:delete(ArchivoSalida),
+            {ok, Filas};
+        _ ->
+            {error, {scheme_termino_con_codigo, Codigo}}
+    end.
