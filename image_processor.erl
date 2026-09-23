@@ -2,12 +2,15 @@
 -export([main/1]).
 
 %% =====================================================================
-%% Punto de entrada. Uso: image_processor Entrada Salida N
-%% Lee el PPM, arma la matriz, la divide en N regiones con halo, las
-%% procesa en paralelo (cada una habla con su propia instancia de
-%% Scheme via llamar_scheme/4) y escribe la imagen reconstruida.
+%% Punto de entrada. Uso: image_processor Entrada Salida N [Filtro]
+%% Filtro es opcional, por defecto "gaussian" (el obligatorio). El
+%% resto del pipeline (lectura, division en regiones, concurrencia,
+%% protocolo con Scheme, reconstruccion) es identico sin importar el
+%% filtro elegido -- Scheme es quien decide que hacer con Filtro.
 %% =====================================================================
 main([Entrada, Salida, NStr]) ->
+    main([Entrada, Salida, NStr, "gaussian"]);
+main([Entrada, Salida, NStr, Filtro]) ->
     N = list_to_integer(NStr),
     {ok, Contenido} = file:read_file(Entrada), %lee el arcihvo
     Texto = binary_to_list(Contenido), %Pasa los bits a una lista
@@ -25,7 +28,7 @@ main([Entrada, Salida, NStr]) ->
     Matriz = pa_matriz(Lista_lista, Ancho),
     Radio = 1, % radio del kernel 3x3 obligatorio
     Regiones = dividir(Matriz, Radio, Alto, N),
-    Resultados = procesar_paralelo(Regiones, Radio, ArchivoKernel),
+    Resultados = procesar_paralelo(Regiones, Radio, ArchivoKernel, Ancho, Filtro),
     MatrizFinal = reconstruir(Resultados),
     escribir_ppm(Salida, Ancho, Alto, Max, MatrizFinal).
 
@@ -167,37 +170,36 @@ escribir_kernel(Archivo, Kernel) ->
     ok = file:write_file(Archivo, Cuerpo).
 
 %% ---------------------------------------------------------------------
-%% linea_a_fila/1: texto de UNA linea del archivo de salida de Scheme
-%% ("R G B R G B ...") -> fila de tuplas {R,G,B}.
+%% leer_salida_scheme/2: lee el archivo que escribio Scheme, sin
+%% importar si vino en una sola linea o en varias -- tokeniza tratando
+%% espacio y salto de linea por igual, agrupa en tuplas {R,G,B}, y usa
+%% Ancho (ya conocido de antemano, del PPM original) para volver a
+%% cortarlo en filas con pa_matriz/2 -- la misma herramienta que ya se
+%% usa para la imagen de entrada. Asi no depende de que Scheme respete
+%% "una fila por linea".
 %% ---------------------------------------------------------------------
-linea_a_fila(Linea) ->
-    Numeros = [list_to_integer(X) || X <- string:tokens(Linea, " ")],
-    agrupar(Numeros).
-
-%% ---------------------------------------------------------------------
-%% leer_salida_scheme/1: lee el archivo que escribio Scheme (una fila
-%% procesada por linea, sin halo, hasta EOF) y lo convierte de vuelta
-%% en una matriz (lista de filas de tuplas {R,G,B}).
-%% ---------------------------------------------------------------------
-leer_salida_scheme(Archivo) ->
+leer_salida_scheme(Archivo, Ancho) ->
     {ok, Contenido} = file:read_file(Archivo),
     Texto = binary_to_list(Contenido),
-    Lineas = string:tokens(Texto, "\n"),
-    [linea_a_fila(L) || L <- Lineas].
+    Tokens = string:tokens(Texto, " \n\r\t"),
+    Numeros = [list_to_integer(X) || X <- Tokens],
+    Pixeles = agrupar(Numeros),
+    pa_matriz(Pixeles, Ancho).
 
 %% ---------------------------------------------------------------------
-%% llamar_scheme/4: ejecuta una instancia de Racket para procesar UNA
-%% region. Escribe su archivo de entrada (region+radio), corre el
-%% script con open_port (para leer su codigo de salida real), y si
-%% salio bien lee el archivo de resultado. Nunca deja pasar un fallo
-%% en silencio: devuelve {ok, Filas} o {error, Motivo}.
+%% llamar_scheme/6: ejecuta una instancia de Racket para procesar UNA
+%% region con el filtro indicado. Escribe su archivo de entrada
+%% (region+radio), corre el script con open_port (para leer su codigo
+%% de salida real), y si salio bien lee el archivo de resultado. Nunca
+%% deja pasar un fallo en silencio: devuelve {ok, Filas} o
+%% {error, Motivo}.
 %% ---------------------------------------------------------------------
-llamar_scheme(Ini, Radio, Submatriz, ArchivoKernel) ->
+llamar_scheme(Ini, Radio, Submatriz, ArchivoKernel, Ancho, Filtro) ->
     ArchivoRegion = "region_" ++ integer_to_list(Ini) ++ ".txt",
     ArchivoSalida = "salida_" ++ integer_to_list(Ini) ++ ".txt",
     escribir_entrada_region(ArchivoRegion, Radio, Submatriz),
 
-    Comando = "racket filtro.rkt " ++ ArchivoRegion ++ " " ++ ArchivoKernel ++ " " ++ ArchivoSalida,
+    Comando = "racket filtro.rkt " ++ ArchivoRegion ++ " " ++ ArchivoKernel ++ " " ++ ArchivoSalida ++ " " ++ Filtro,
     Puerto = open_port({spawn, Comando}, [exit_status]),
     Codigo = receive
         {Puerto, {exit_status, C}} -> C
@@ -207,7 +209,7 @@ llamar_scheme(Ini, Radio, Submatriz, ArchivoKernel) ->
 
     case Codigo of
         0 ->
-            Filas = leer_salida_scheme(ArchivoSalida),
+            Filas = leer_salida_scheme(ArchivoSalida, Ancho),
             file:delete(ArchivoSalida),
             {ok, Filas};
         _ ->
@@ -219,29 +221,29 @@ llamar_scheme(Ini, Radio, Submatriz, ArchivoKernel) ->
 %% =======================================================================
 
 %% ---------------------------------------------------------------------
-%% trabajador/5: codigo que corre DENTRO de cada proceso hijo (Paso 3).
-%% Le pide a llamar_scheme/4 que procese la region de verdad, y le
+%% trabajador/7: codigo que corre DENTRO de cada proceso hijo (Paso 3).
+%% Le pide a llamar_scheme/6 que procese la region de verdad, y le
 %% manda el resultado (o el error) al padre, etiquetado con Ini.
 %% ---------------------------------------------------------------------
-trabajador(Padre, Ini, Radio, Submatriz, ArchivoKernel) ->
-    case llamar_scheme(Ini, Radio, Submatriz, ArchivoKernel) of
+trabajador(Padre, Ini, Radio, Submatriz, ArchivoKernel, Ancho, Filtro) ->
+    case llamar_scheme(Ini, Radio, Submatriz, ArchivoKernel, Ancho, Filtro) of
         {ok, Filas} -> Padre ! {resultado, Ini, Filas};
         {error, Motivo} -> Padre ! {error, Ini, Motivo}
     end.
 
 %% ---------------------------------------------------------------------
-%% procesar_paralelo/3: crea un proceso (spawn) por cada region de
+%% procesar_paralelo/5: crea un proceso (spawn) por cada region de
 %% ListaDeRegiones (la salida de dividir/4) y espera todos los
 %% resultados. Como corren en paralelo, pueden terminar en cualquier
 %% orden -- por eso cada uno vuelve etiquetado con su Ini.
-%% procesar_paralelo([[Ini,Submatriz],...], Radio, ArchivoKernel) ->
-%%   [{Ini,Filas}, ...]
+%% procesar_paralelo([[Ini,Submatriz],...], Radio, ArchivoKernel, Ancho,
+%%   Filtro) -> [{Ini,Filas}, ...]
 %% ---------------------------------------------------------------------
-procesar_paralelo(ListaDeRegiones, Radio, ArchivoKernel) ->
+procesar_paralelo(ListaDeRegiones, Radio, ArchivoKernel, Ancho, Filtro) ->
     Padre = self(),
     lists:foreach(
         fun([Ini, Submatriz]) ->
-            spawn(fun() -> trabajador(Padre, Ini, Radio, Submatriz, ArchivoKernel) end)
+            spawn(fun() -> trabajador(Padre, Ini, Radio, Submatriz, ArchivoKernel, Ancho, Filtro) end)
         end,
         ListaDeRegiones
     ),
